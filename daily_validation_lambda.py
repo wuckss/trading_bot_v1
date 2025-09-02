@@ -33,8 +33,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load configuration from environment variables
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
-CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-opus-4-1')
 ENABLE_DEEP_RESEARCH = os.getenv('ENABLE_DEEP_RESEARCH', 'false').lower() == 'true'
 
 # Google Sheets configuration
@@ -344,19 +344,19 @@ class DailyValidationProcessor:
             for attempt in range(3):
                 try:
                     response = self.openai_client.chat.completions.create(
-                        model=OPENAI_MODEL,
+                        model=OPENAI_MODEL,  # gpt-5 or gpt-5-mini
                         messages=[
                             {
                                 "role": "system",
-                                "content": "You are a professional trading desk analyst providing daily trade validation and risk assessment. Be concise and actionable."
+                                "content": "You are a precise, concise trading assistant providing daily trade validation and risk assessment."
                             },
                             {
                                 "role": "user",
                                 "content": validation_prompt
                             }
                         ],
-                        max_tokens=2000,
-                        temperature=0.2
+                        max_tokens=4096,  # Increased for daily validation
+                        temperature=0.2  # Precise temperature
                     )
                     
                     validation_content = response.choices[0].message.content
@@ -402,10 +402,10 @@ class DailyValidationProcessor:
             for attempt in range(3):
                 try:
                     response = self.anthropic_client.messages.create(
-                        model=CLAUDE_MODEL,
-                        max_tokens=2000,
-                        temperature=0.2,
-                        system="You are an experienced trading desk analyst providing daily trade validation. Focus on actionable insights and risk management.",
+                        model=CLAUDE_MODEL,  # claude-opus-4-1 or pinned version
+                        max_tokens=4096,  # Increased for daily validation
+                        temperature=0.2,  # Precise temperature
+                        system="You are a precise, risk-aware trading researcher providing daily trade validation. Focus on actionable insights and risk management.",
                         messages=[
                             {
                                 "role": "user",

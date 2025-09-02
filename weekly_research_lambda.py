@@ -33,8 +33,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load configuration from environment variables
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
-CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-opus-4-1')
 ENABLE_DEEP_RESEARCH = os.getenv('ENABLE_DEEP_RESEARCH', 'true').lower() == 'true'
 
 # Google Sheets configuration
@@ -349,19 +349,19 @@ class WeeklyResearchProcessor:
             for attempt in range(3):
                 try:
                     response = self.openai_client.chat.completions.create(
-                        model=OPENAI_MODEL,
+                        model=OPENAI_MODEL,  # gpt-5 or gpt-5-mini
                         messages=[
                             {
                                 "role": "system", 
-                                "content": "You are an expert Wall Street trading analyst with deep market knowledge and research capabilities. Provide detailed, actionable trading research."
+                                "content": "You are a precise, concise trading assistant with deep market expertise and comprehensive analytical capabilities."
                             },
                             {
                                 "role": "user",
                                 "content": enhanced_prompt
                             }
                         ],
-                        max_tokens=4000,
-                        temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.7
+                        max_tokens=16384,  # Maximum tokens for comprehensive weekly research
+                        temperature=0.2  # Precise temperature for consistency
                     )
                     
                     research_content = response.choices[0].message.content
@@ -416,10 +416,10 @@ Focus on:
             for attempt in range(3):
                 try:
                     response = self.anthropic_client.messages.create(
-                        model=CLAUDE_MODEL,
-                        max_tokens=8000,
-                        temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.3,
-                        system=system_prompt if ENABLE_DEEP_RESEARCH else "You are an experienced trading analyst providing actionable market research.",
+                        model=CLAUDE_MODEL,  # claude-opus-4-1 or pinned version
+                        max_tokens=8192,  # Maximum tokens for comprehensive weekly research  
+                        temperature=0.2,  # Precise temperature for consistency
+                        system="You are a precise, risk-aware trading researcher with elite Wall Street expertise and comprehensive analytical capabilities.",
                         messages=[
                             {
                                 "role": "user", 
