@@ -10,6 +10,7 @@ import json
 import os
 import logging
 import time
+import base64
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 import hashlib
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # Load configuration from environment variables
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5')
-CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-opus-4-1')
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-opus-4-1')
 ENABLE_DEEP_RESEARCH = os.getenv('ENABLE_DEEP_RESEARCH', 'false').lower() == 'true'
 
 # Google Sheets configuration
@@ -230,8 +231,9 @@ class DailyValidationProcessor:
     def _init_google_sheets(self):
         """Initialize Google Sheets API client"""
         try:
-            # Get raw JSON service account credentials
-            google_json = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON')
+            # Get base64 encoded service account JSON
+            google_json_b64 = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
+            google_json = base64.b64decode(google_json_b64).decode('utf-8')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
@@ -255,7 +257,7 @@ class DailyValidationProcessor:
         try:
             api_key = self._get_env_var('ANTHROPIC_API_KEY')
             self.anthropic_client = anthropic.Anthropic(api_key=api_key)
-            logger.info(f"Anthropic API initialized successfully with model: {CLAUDE_MODEL}")
+            logger.info(f"Anthropic API initialized successfully with model: {ANTHROPIC_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize Anthropic API: {e}")
             raise
@@ -500,7 +502,7 @@ class DailyValidationProcessor:
             for attempt in range(3):
                 try:
                     response = self.anthropic_client.messages.create(
-                        model=CLAUDE_MODEL,  # claude-opus-4-1 or pinned version
+                        model=ANTHROPIC_MODEL,  # claude-opus-4-1 or pinned version
                         max_tokens=4096,  # Increased for daily validation
                         temperature=0.2,  # Precise temperature
                         system="You are a precise, risk-aware trading researcher providing daily trade validation. Focus on actionable insights and risk management.",

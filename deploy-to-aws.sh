@@ -67,6 +67,9 @@ prompt_env_var "ANTHROPIC_API_KEY" "Anthropic API Key (sk-ant-...)" "true"
 echo -e "\n${BLUE}For Google Sheets integration, you'll need a service account JSON.${NC}"
 echo -e "${BLUE}Get it from: https://console.cloud.google.com/iam-admin/serviceaccounts${NC}"
 prompt_env_var "GOOGLE_SERVICE_ACCOUNT_JSON" "Google Service Account JSON (entire JSON object)" "false"
+
+# Base64 encode the JSON for safe environment variable storage
+export GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=$(echo -n "$GOOGLE_SERVICE_ACCOUNT_JSON" | base64 -w 0)
 prompt_env_var "GOOGLE_SHEETS_WEEKLY_ID" "Google Sheets Weekly Research ID" "false"
 prompt_env_var "GOOGLE_SHEETS_DAILY_ID" "Google Sheets Daily Validation ID" "false"
 
@@ -77,7 +80,7 @@ export DAILY_PM_SHEET_NAME="Daily_PM"
 
 # Model Configuration (with defaults)
 export OPENAI_MODEL="gpt-5"
-export CLAUDE_MODEL="claude-opus-4-1"
+export ANTHROPIC_MODEL="claude-opus-4-1"
 export ENABLE_DEEP_RESEARCH="true"
 
 # Telegram Configuration
@@ -148,34 +151,52 @@ BUILD_DIR="lambda-builds"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-# Function to create deployment package
-create_lambda_package() {
-    local function_name="$1"
-    local python_file="$2"
-    local package_dir="$BUILD_DIR/${function_name}"
+# Check if Docker is available
+if command -v docker &> /dev/null; then
+    echo "Using Docker for Lambda packaging (recommended for binary dependencies)..."
     
-    echo "Creating package for $function_name..."
+    # Build Lambda packages using Docker
+    docker build -f Dockerfile.lambda -t ai-trading-lambda-builder .
     
-    # Create package directory
-    mkdir -p "$package_dir"
+    # Extract packages from Docker container
+    CONTAINER_ID=$(docker create ai-trading-lambda-builder)
+    docker cp "$CONTAINER_ID:/tmp/weekly-research.zip" "$BUILD_DIR/"
+    docker cp "$CONTAINER_ID:/tmp/daily-validation.zip" "$BUILD_DIR/"
+    docker rm "$CONTAINER_ID" &>/dev/null
     
-    # Install dependencies
-    pip install -r requirements.txt -t "$package_dir" --quiet
+    echo -e "${GREEN}✅ Docker-based packages created successfully${NC}"
+else
+    echo -e "${YELLOW}⚠️  Docker not available, using pip install (may have compatibility issues)${NC}"
     
-    # Copy Lambda function
-    cp "$python_file" "$package_dir/lambda_function.py"
-    
-    # Create ZIP package
-    cd "$package_dir"
-    zip -r "../${function_name}.zip" . --quiet
-    cd - &>/dev/null
-    
-    echo -e "${GREEN}✓ Package created: ${function_name}.zip${NC}"
-}
+    # Function to create deployment package (fallback)
+    create_lambda_package() {
+        local function_name="$1"
+        local python_file="$2"
+        local package_dir="$BUILD_DIR/${function_name}"
+        
+        echo "Creating package for $function_name..."
+        
+        # Create package directory
+        mkdir -p "$package_dir"
+        
+        # Install dependencies
+        pip install -r requirements.txt -t "$package_dir" --quiet
+        
+        # Copy Lambda function
+        cp "$python_file" "$package_dir/lambda_function.py"
+        
+        # Create ZIP package
+        cd "$package_dir"
+        zip -r "../${function_name}.zip" . --quiet
+        cd - &>/dev/null
+        
+        echo -e "${GREEN}✓ Package created: ${function_name}.zip${NC}"
+    }
 
-# Create packages for both functions
-create_lambda_package "weekly-research" "weekly_research_lambda.py"
-create_lambda_package "daily-validation" "daily_validation_lambda.py"
+    # Create packages for both functions
+    create_lambda_package "weekly-research" "weekly_research_lambda.py"
+    create_lambda_package "daily-validation" "daily_validation_lambda.py"
+fi
 
 # =============================================================================
 # Step 4: Deploy Lambda Functions  
@@ -213,24 +234,41 @@ deploy_lambda() {
             --memory-size "$memory" &>/dev/null
     fi
     
+    # Create environment variables JSON safely
+    ENV_VARS=$(jq -n \
+        --arg openai_key "$OPENAI_API_KEY" \
+        --arg anthropic_key "$ANTHROPIC_API_KEY" \
+        --arg google_json_b64 "$GOOGLE_SERVICE_ACCOUNT_JSON_BASE64" \
+        --arg weekly_id "$GOOGLE_SHEETS_WEEKLY_ID" \
+        --arg daily_id "$GOOGLE_SHEETS_DAILY_ID" \
+        --arg weekly_sheet "$WEEKLY_SHEET_NAME" \
+        --arg daily_am_sheet "$DAILY_AM_SHEET_NAME" \
+        --arg daily_pm_sheet "$DAILY_PM_SHEET_NAME" \
+        --arg openai_model "$OPENAI_MODEL" \
+        --arg anthropic_model "$ANTHROPIC_MODEL" \
+        --arg enable_research "$ENABLE_DEEP_RESEARCH" \
+        --arg telegram_token "$TELEGRAM_BOT_TOKEN" \
+        --arg telegram_chat "$TELEGRAM_CHAT_ID" \
+        '{
+            "OPENAI_API_KEY": $openai_key,
+            "ANTHROPIC_API_KEY": $anthropic_key,
+            "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64": $google_json_b64,
+            "GOOGLE_SHEETS_WEEKLY_ID": $weekly_id,
+            "GOOGLE_SHEETS_DAILY_ID": $daily_id,
+            "WEEKLY_SHEET_NAME": $weekly_sheet,
+            "DAILY_AM_SHEET_NAME": $daily_am_sheet,
+            "DAILY_PM_SHEET_NAME": $daily_pm_sheet,
+            "OPENAI_MODEL": $openai_model,
+            "ANTHROPIC_MODEL": $anthropic_model,
+            "ENABLE_DEEP_RESEARCH": $enable_research,
+            "TELEGRAM_BOT_TOKEN": $telegram_token,
+            "TELEGRAM_CHAT_ID": $telegram_chat
+        }')
+    
     # Update environment variables
     aws lambda update-function-configuration \
         --function-name "$full_name" \
-        --environment Variables="{\
-OPENAI_API_KEY=\"$OPENAI_API_KEY\",\
-ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\",\
-GOOGLE_SERVICE_ACCOUNT_JSON=\"$GOOGLE_SERVICE_ACCOUNT_JSON\",\
-GOOGLE_SHEETS_WEEKLY_ID=\"$GOOGLE_SHEETS_WEEKLY_ID\",\
-GOOGLE_SHEETS_DAILY_ID=\"$GOOGLE_SHEETS_DAILY_ID\",\
-WEEKLY_SHEET_NAME=\"$WEEKLY_SHEET_NAME\",\
-DAILY_AM_SHEET_NAME=\"$DAILY_AM_SHEET_NAME\",\
-DAILY_PM_SHEET_NAME=\"$DAILY_PM_SHEET_NAME\",\
-OPENAI_MODEL=\"$OPENAI_MODEL\",\
-CLAUDE_MODEL=\"$CLAUDE_MODEL\",\
-ENABLE_DEEP_RESEARCH=\"$ENABLE_DEEP_RESEARCH\",\
-TELEGRAM_BOT_TOKEN=\"$TELEGRAM_BOT_TOKEN\",\
-TELEGRAM_CHAT_ID=\"$TELEGRAM_CHAT_ID\"\
-}" &>/dev/null
+        --environment Variables="$ENV_VARS" &>/dev/null
     
     echo -e "${GREEN}✅ $full_name deployed successfully${NC}"
 }
@@ -294,14 +332,14 @@ create_eventbridge_rule "weekly-schedule" "weekly-research" \
 
 # Daily AM Validation: Monday-Friday at 12:00 UTC (8:00 AM ET)
 create_eventbridge_rule "daily-am-schedule" "daily-validation" \
-    "cron(0 12 * * MON-FRI *)" \
+    "cron(0 12 ? * MON-FRI *)" \
     "Daily AM Trade Validation - Runs weekdays at 8 AM ET" \
     '{"session_type":"AM"}'
 
-# Daily PM Validation: Monday-Friday at 20:00 UTC (3:00 PM ET) 
+# Daily PM Validation: Monday-Friday at 19:30 UTC (3:30 PM ET) 
 create_eventbridge_rule "daily-pm-schedule" "daily-validation" \
-    "cron(0 20 * * MON-FRI *)" \
-    "Daily PM Trade Validation - Runs weekdays at 3 PM ET" \
+    "cron(30 19 ? * MON-FRI *)" \
+    "Daily PM Trade Validation - Runs weekdays at 3:30 PM ET" \
     '{"session_type":"PM"}'
 
 echo -e "${GREEN}✅ All EventBridge rules created${NC}"
