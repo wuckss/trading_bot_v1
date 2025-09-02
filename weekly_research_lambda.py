@@ -239,21 +239,36 @@ class WeeklyResearchProcessor:
         try:
             idempotency_key = self._generate_idempotency_key()
             
-            # Check if this key exists in the sheet
+            # Check both column A (free-form headers) and column V (structured Run ID)
+            # Get the entire sheet data to check both locations
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.sheet_name}!A:A"
+                range=f"{self.sheet_name}!A:V"
             ).execute()
             
             values = result.get('values', [])
             
             # Look for the idempotency key in existing data
-            for row in values:
-                if row and idempotency_key in str(row[0]):
-                    logger.info(f"Idempotency check: Research already exists for key {idempotency_key}")
+            for i, row in enumerate(values):
+                if not row:
+                    continue
+                    
+                # Check column A (index 0) for free-form headers with idempotency key
+                if len(row) > 0 and row[0] and idempotency_key in str(row[0]):
+                    logger.info(f"Idempotency check: Research already exists for key {idempotency_key} in column A (row {i+1})")
                     return False  # Already exists, skip
+                
+                # Check column V (index 21) for structured data Run ID
+                if len(row) > 21 and row[21]:
+                    run_id_content = str(row[21])
+                    if (idempotency_key in run_id_content or 
+                        self.run_id in run_id_content or
+                        # Also check for partial matches of the ISO week pattern
+                        any(key_part in run_id_content for key_part in idempotency_key.split('_') if len(key_part) > 6)):
+                        logger.info(f"Idempotency check: Research already exists for Run ID {self.run_id} in column V (row {i+1})")
+                        return False  # Already exists, skip
             
-            logger.info(f"Idempotency check: No existing research for key {idempotency_key}, proceeding")
+            logger.info(f"Idempotency check: No existing research for key {idempotency_key} or Run ID {self.run_id}, proceeding")
             return True  # Doesn't exist, proceed
             
         except Exception as e:
@@ -526,7 +541,7 @@ Focus on:
         row[0] = ticker  # Ticker
         row[19] = source  # AI Source
         row[20] = timestamp  # Generated Timestamp
-        row[21] = self.run_id  # Run ID
+        row[21] = f"{self.run_id}|{self._generate_idempotency_key()}"  # Run ID + Idempotency Key for better matching
         
         # Join the context to search for patterns
         full_context = ' '.join(context_lines[:5])
@@ -583,7 +598,7 @@ Focus on:
         row[6] = parts[4] if len(parts) > 4 else ''  # Thesis
         row[19] = source  # AI Source
         row[20] = timestamp  # Timestamp
-        row[21] = self.run_id  # Run ID
+        row[21] = f"{self.run_id}|{self._generate_idempotency_key()}"  # Run ID + Idempotency Key for better matching
         
         return row
     

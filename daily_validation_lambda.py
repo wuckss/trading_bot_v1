@@ -194,7 +194,8 @@ class DailyValidationProcessor:
         try:
             idempotency_key = self._generate_idempotency_key()
             
-            # Check if this key exists in the sheet
+            # For daily validation, we only use column A (single column format)
+            # Check if this key or run ID exists in the sheet
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"{self.sheet_name}!A:A"
@@ -202,13 +203,20 @@ class DailyValidationProcessor:
             
             values = result.get('values', [])
             
-            # Look for the idempotency key in existing data
-            for row in values:
-                if row and idempotency_key in str(row[0]):
-                    logger.info(f"Idempotency check: Validation already exists for key {idempotency_key}")
+            # Look for the idempotency key or run ID in existing data
+            for i, row in enumerate(values):
+                if not row or not row[0]:
+                    continue
+                    
+                row_content = str(row[0])
+                # Check for idempotency key or run ID in the content
+                if (idempotency_key in row_content or 
+                    self.run_id in row_content or
+                    f"ID:{idempotency_key}" in row_content):
+                    logger.info(f"Idempotency check: Validation already exists for key {idempotency_key} or Run ID {self.run_id} (row {i+1})")
                     return False  # Already exists, skip
             
-            logger.info(f"Idempotency check: No existing validation for key {idempotency_key}, proceeding")
+            logger.info(f"Idempotency check: No existing validation for key {idempotency_key} or Run ID {self.run_id}, proceeding")
             return True  # Doesn't exist, proceed
             
         except Exception as e:
