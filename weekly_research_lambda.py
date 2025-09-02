@@ -9,13 +9,16 @@ from both OpenAI and Claude APIs using the latest models.
 import json
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
+import hashlib
 import boto3
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 import openai
 import anthropic
+import pandas_market_calendars as mcal
+import pytz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +31,10 @@ ENABLE_DEEP_RESEARCH = True  # Enable enhanced research mode for both models
 
 # .env.example file path
 ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), '.env.example')
+
+# Market and timezone configuration
+US_EASTERN = pytz.timezone('US/Eastern')
+NYSE_CALENDAR = mcal.get_calendar('NYSE')
 
 # Trading research prompt
 TRADING_RESEARCH_PROMPT = """Title: 5-Day Alpha Sprint — Micro/Mid-Cap Trading Desk (High Risk Small Account)
@@ -137,6 +144,122 @@ class WeeklyResearchProcessor:
         except Exception as e:
             logger.warning(f"Failed to load .env.example file: {e}")
             return {}
+    
+    def _generate_idempotency_key(self) -> str:
+        """Generate idempotency key based on ISO week + Sunday timestamp bucket"""
+        now_et = datetime.now(US_EASTERN)
+        
+        # Get ISO week (year, week_number)
+        iso_year, iso_week, _ = now_et.isocalendar()
+        
+        # Create timestamp bucket (Sunday 08:00 ET window)
+        # Find the Sunday of this week
+        days_since_monday = now_et.weekday()  # Monday = 0, Sunday = 6
+        days_to_sunday = (6 - days_since_monday) % 7
+        if days_to_sunday == 0 and now_et.weekday() == 6:  # It's Sunday
+            sunday = now_et.date()
+        else:
+            sunday = (now_et - timedelta(days=days_since_monday + 1)).date()
+        
+        # Create the bucket identifier
+        bucket_id = f"weekly_{iso_year}W{iso_week:02d}_{sunday}_08ET"
+        
+        # Generate hash for idempotency
+        idempotency_key = hashlib.md5(bucket_id.encode()).hexdigest()[:12]
+        
+        logger.info(f"Generated idempotency key: {idempotency_key} for bucket: {bucket_id}")
+        return idempotency_key
+    
+    def _is_market_open_week(self) -> bool:
+        """Check if this is a market trading week using NYSE calendar"""
+        try:
+            now_et = datetime.now(US_EASTERN)
+            
+            # Get the current week's trading days
+            week_start = now_et - timedelta(days=now_et.weekday())  # Monday
+            week_end = week_start + timedelta(days=6)  # Sunday
+            
+            # Get trading sessions for this week
+            trading_days = NYSE_CALENDAR.sessions_in_range(
+                week_start.date(), 
+                week_end.date()
+            )
+            
+            has_trading_days = len(trading_days) > 0
+            logger.info(f"Market week check: {len(trading_days)} trading days this week")
+            
+            if not has_trading_days:
+                logger.info("No trading days this week - skipping research generation")
+                
+            return has_trading_days
+            
+        except Exception as e:
+            logger.warning(f"Failed to check market calendar, proceeding anyway: {e}")
+            return True  # Fail open - run research if calendar check fails
+    
+    def _is_end_of_trading_week(self) -> bool:
+        """Check if we should run end-of-week research based on actual trading schedule"""
+        try:
+            now_et = datetime.now(US_EASTERN)
+            
+            # Get this week's trading schedule
+            week_start = now_et - timedelta(days=now_et.weekday())  # Monday  
+            week_end = week_start + timedelta(days=6)  # Sunday
+            
+            trading_days = NYSE_CALENDAR.sessions_in_range(
+                week_start.date(),
+                week_end.date() 
+            )
+            
+            if len(trading_days) == 0:
+                return False  # No trading this week
+                
+            # Get the last trading day of the week
+            last_trading_day = trading_days[-1].date()
+            
+            # Check if the last trading day has passed (market close)
+            last_trading_datetime = US_EASTERN.localize(
+                datetime.combine(last_trading_day, datetime.min.time().replace(hour=16))
+            )
+            
+            is_end_of_week = now_et >= last_trading_datetime
+            
+            logger.info(f"End of trading week check: Last trading day was {last_trading_day}, "
+                       f"current time: {now_et.strftime('%Y-%m-%d %H:%M %Z')}, "
+                       f"is end of week: {is_end_of_week}")
+            
+            return is_end_of_week
+            
+        except Exception as e:
+            logger.warning(f"Failed to check end of trading week, using Sunday logic: {e}")
+            # Fallback to simple Sunday check
+            return now_et.weekday() == 6  # Sunday
+    
+    def _check_idempotency(self) -> bool:
+        """Check if this research has already been generated (idempotency check)"""
+        try:
+            idempotency_key = self._generate_idempotency_key()
+            
+            # Check if this key exists in the sheet
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.sheet_name}!A:A"
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Look for the idempotency key in existing data
+            for row in values:
+                if row and idempotency_key in str(row[0]):
+                    logger.info(f"Idempotency check: Research already exists for key {idempotency_key}")
+                    return False  # Already exists, skip
+            
+            logger.info(f"Idempotency check: No existing research for key {idempotency_key}, proceeding")
+            return True  # Doesn't exist, proceed
+            
+        except Exception as e:
+            logger.warning(f"Idempotency check failed, proceeding anyway: {e}")
+            return True  # Fail open
     
     def _get_api_key(self, key_name: str) -> str:
         """Get API key from .env.example file or environment variable"""
@@ -321,6 +444,7 @@ Focus on:
         """Parse AI research content into structured spreadsheet rows"""
         rows = []
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        idempotency_key = self._generate_idempotency_key()
         
         # Try to extract structured trade data from the response
         trade_rows = self._extract_trade_data(research_content, source, timestamp)
@@ -330,7 +454,7 @@ Focus on:
             rows.extend(trade_rows)
         else:
             # Fallback to free-form text if parsing fails
-            rows.append([f"=== {source.upper()} RESEARCH - {timestamp} ==="])
+            rows.append([f"=== {source.upper()} RESEARCH - {timestamp} - ID:{idempotency_key} ==="])
             rows.append([])
             
             lines = research_content.split('\n')
@@ -534,19 +658,44 @@ Focus on:
         """Main processing function for weekly research"""
         results = {
             'success': False,
+            'skipped': False,
+            'skip_reason': '',
             'openai_success': False,
             'claude_success': False,
             'sheet_cleared': False,
             'sheet_updated': False,
+            'market_open_week': False,
+            'end_of_trading_week': False,
+            'idempotency_check': False,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'errors': []
         }
         
         try:
-            # Step 1: Clear the sheet except header
+            # Step 1: Market calendar checks
+            results['market_open_week'] = self._is_market_open_week()
+            if not results['market_open_week']:
+                results['skipped'] = True
+                results['skip_reason'] = 'No trading days this week (market holiday week)'
+                return results
+            
+            results['end_of_trading_week'] = self._is_end_of_trading_week()
+            if not results['end_of_trading_week']:
+                results['skipped'] = True
+                results['skip_reason'] = 'Not end of trading week yet'
+                return results
+            
+            # Step 2: Idempotency check
+            results['idempotency_check'] = self._check_idempotency()
+            if not results['idempotency_check']:
+                results['skipped'] = True
+                results['skip_reason'] = 'Research already generated for this week (idempotency)'
+                return results
+            
+            # Step 3: Clear the sheet except header
             results['sheet_cleared'] = self.clear_sheet_except_header()
             
-            # Step 2: Generate research from both AIs in parallel
+            # Step 4: Generate research from both AIs
             openai_content = None
             claude_content = None
             
@@ -562,7 +711,7 @@ Focus on:
             except Exception as e:
                 results['errors'].append(f"Claude error: {str(e)}")
             
-            # Step 3: Write results to sheet
+            # Step 5: Write results to sheet
             if openai_content or claude_content:
                 results['sheet_updated'] = self.write_to_sheet(openai_content, claude_content)
             

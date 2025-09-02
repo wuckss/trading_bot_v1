@@ -9,12 +9,15 @@ and narrow down trades from both OpenAI and Claude APIs.
 import json
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
+import hashlib
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 import openai
 import anthropic
+import pandas_market_calendars as mcal
+import pytz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +30,10 @@ ENABLE_DEEP_RESEARCH = False  # Standard mode for daily validation (change to Tr
 
 # .env.example file path
 ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), '.env.example')
+
+# Market and timezone configuration
+US_EASTERN = pytz.timezone('US/Eastern')
+NYSE_CALENDAR = mcal.get_calendar('NYSE')
 
 # Daily validation prompt
 DAILY_VALIDATION_PROMPT = """Title: Daily Trade Validation & Narrowing — Micro/Mid-Cap Desk
@@ -110,6 +117,102 @@ class DailyValidationProcessor:
         except Exception as e:
             logger.warning(f"Failed to load .env.example file: {e}")
             return {}
+    
+    def _generate_idempotency_key(self) -> str:
+        """Generate idempotency key based on date + session + timestamp bucket"""
+        now_et = datetime.now(US_EASTERN)
+        
+        # Create timestamp bucket based on session type
+        if self.session_type == "AM":
+            # AM session: 08:00 ET bucket
+            bucket_time = "08ET"
+        else:
+            # PM session: 15:30 ET bucket  
+            bucket_time = "1530ET"
+        
+        # Create the bucket identifier
+        bucket_id = f"daily_{self.session_type}_{now_et.date()}_{bucket_time}"
+        
+        # Generate hash for idempotency
+        idempotency_key = hashlib.md5(bucket_id.encode()).hexdigest()[:12]
+        
+        logger.info(f"Generated idempotency key: {idempotency_key} for bucket: {bucket_id}")
+        return idempotency_key
+    
+    def _is_trading_day(self) -> bool:
+        """Check if today is a trading day using NYSE calendar"""
+        try:
+            now_et = datetime.now(US_EASTERN)
+            today = now_et.date()
+            
+            # Get trading sessions for today
+            trading_days = NYSE_CALENDAR.sessions_in_range(today, today)
+            
+            is_trading_day = len(trading_days) > 0
+            logger.info(f"Trading day check: {today} is {'a' if is_trading_day else 'not a'} trading day")
+            
+            if not is_trading_day:
+                logger.info("Not a trading day - skipping validation")
+                
+            return is_trading_day
+            
+        except Exception as e:
+            logger.warning(f"Failed to check trading calendar, proceeding anyway: {e}")
+            return True  # Fail open - run validation if calendar check fails
+    
+    def _is_valid_session_time(self) -> bool:
+        """Check if current time is appropriate for the session type"""
+        try:
+            now_et = datetime.now(US_EASTERN)
+            current_time = now_et.time()
+            
+            if self.session_type == "AM":
+                # AM session: 06:00 - 09:30 ET (before market open)
+                start_time = datetime.strptime("06:00", "%H:%M").time()
+                end_time = datetime.strptime("09:30", "%H:%M").time()
+                valid = start_time <= current_time <= end_time
+                session_window = "06:00-09:30 ET (premarket)"
+            else:
+                # PM session: 15:00 - 18:00 ET (after market close)
+                start_time = datetime.strptime("15:00", "%H:%M").time()
+                end_time = datetime.strptime("18:00", "%H:%M").time()
+                valid = start_time <= current_time <= end_time
+                session_window = "15:00-18:00 ET (post-market)"
+            
+            logger.info(f"Session time check: Current time {current_time.strftime('%H:%M')} ET, "
+                       f"valid window {session_window}: {'✓' if valid else '✗'}")
+            
+            return valid
+            
+        except Exception as e:
+            logger.warning(f"Failed to check session time, proceeding anyway: {e}")
+            return True  # Fail open
+    
+    def _check_idempotency(self) -> bool:
+        """Check if this validation has already been generated (idempotency check)"""
+        try:
+            idempotency_key = self._generate_idempotency_key()
+            
+            # Check if this key exists in the sheet
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.sheet_name}!A:A"
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Look for the idempotency key in existing data
+            for row in values:
+                if row and idempotency_key in str(row[0]):
+                    logger.info(f"Idempotency check: Validation already exists for key {idempotency_key}")
+                    return False  # Already exists, skip
+            
+            logger.info(f"Idempotency check: No existing validation for key {idempotency_key}, proceeding")
+            return True  # Doesn't exist, proceed
+            
+        except Exception as e:
+            logger.warning(f"Idempotency check failed, proceeding anyway: {e}")
+            return True  # Fail open
     
     def _get_api_key(self, key_name: str) -> str:
         """Get API key from .env.example file or environment variable"""
@@ -324,9 +427,10 @@ class DailyValidationProcessor:
         """Parse AI validation content into spreadsheet rows"""
         rows = []
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        idempotency_key = self._generate_idempotency_key()
         
-        # Add source identifier and session type
-        rows.append([f"=== {source.upper()} {self.session_type} VALIDATION - {timestamp} ==="])
+        # Add source identifier and session type with idempotency key
+        rows.append([f"=== {source.upper()} {self.session_type} VALIDATION - {timestamp} - ID:{idempotency_key} ==="])
         rows.append([])  # Empty row for spacing
         
         # Split content into lines and process
@@ -426,23 +530,49 @@ class DailyValidationProcessor:
         """Main processing function for daily validation"""
         results = {
             'success': False,
+            'skipped': False,
+            'skip_reason': '',
             'session_type': self.session_type,
             'openai_success': False,
             'claude_success': False,
             'sheet_cleared': False,
             'sheet_updated': False,
+            'is_trading_day': False,
+            'valid_session_time': False,
+            'idempotency_check': False,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'errors': []
         }
         
         try:
-            # Step 1: Get previous research data
+            # Step 1: Trading day check
+            results['is_trading_day'] = self._is_trading_day()
+            if not results['is_trading_day']:
+                results['skipped'] = True
+                results['skip_reason'] = 'Not a trading day (market holiday/weekend)'
+                return results
+            
+            # Step 2: Session time check
+            results['valid_session_time'] = self._is_valid_session_time()
+            if not results['valid_session_time']:
+                results['skipped'] = True
+                results['skip_reason'] = f'Outside valid {self.session_type} session time window'
+                return results
+            
+            # Step 3: Idempotency check
+            results['idempotency_check'] = self._check_idempotency()
+            if not results['idempotency_check']:
+                results['skipped'] = True
+                results['skip_reason'] = f'Validation already generated for this {self.session_type} session (idempotency)'
+                return results
+            
+            # Step 4: Get previous research data
             previous_data = self.get_previous_research_data()
             
-            # Step 2: Clear the sheet except header
+            # Step 5: Clear the sheet except header
             results['sheet_cleared'] = self.clear_sheet_except_header()
             
-            # Step 3: Generate validation from both AIs
+            # Step 6: Generate validation from both AIs
             openai_content = None
             claude_content = None
             
@@ -458,7 +588,7 @@ class DailyValidationProcessor:
             except Exception as e:
                 results['errors'].append(f"Claude error: {str(e)}")
             
-            # Step 4: Write results to sheet
+            # Step 7: Write results to sheet
             if openai_content or claude_content:
                 results['sheet_updated'] = self.write_to_sheet(openai_content, claude_content)
             
