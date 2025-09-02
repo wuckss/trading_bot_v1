@@ -9,7 +9,6 @@ and narrow down trades from both OpenAI and Claude APIs.
 import json
 import os
 import logging
-import base64
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
@@ -226,9 +225,8 @@ class DailyValidationProcessor:
     def _init_google_sheets(self):
         """Initialize Google Sheets API client"""
         try:
-            # Get base64 encoded service account JSON
-            google_json_b64 = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
-            google_json = base64.b64decode(google_json_b64).decode('utf-8')
+            # Get raw JSON service account credentials
+            google_json = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
@@ -240,8 +238,8 @@ class DailyValidationProcessor:
     def _init_openai(self):
         """Initialize OpenAI API client"""
         try:
-            api_key = self._get_env_var('OPENAI_API_KEY')
-            self.openai_client = openai.OpenAI(api_key=api_key)
+            # OpenAI client automatically reads OPENAI_API_KEY from environment
+            self.openai_client = openai.OpenAI()
             logger.info(f"OpenAI API initialized successfully with model: {OPENAI_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI API: {e}")
@@ -364,7 +362,8 @@ class DailyValidationProcessor:
                             }
                         ],
                         max_tokens=4096,  # Increased for daily validation
-                        temperature=0.2  # Precise temperature
+                        temperature=0.2,  # Precise temperature
+                        timeout=60  # 1 minute timeout
                     )
                     
                     validation_content = response.choices[0].message.content
@@ -419,7 +418,8 @@ class DailyValidationProcessor:
                                 "role": "user",
                                 "content": validation_prompt
                             }
-                        ]
+                        ],
+                        timeout=60  # 1 minute timeout
                     )
                     
                     validation_content = response.content[0].text
@@ -480,7 +480,7 @@ class DailyValidationProcessor:
             all_rows = []
             
             # Create headers for daily validation - single column for content
-            headers = ["Validation Content"]
+            headers = ["Content"]
             
             # Check if headers exist, if not create them
             try:
@@ -516,8 +516,8 @@ class DailyValidationProcessor:
                 logger.error("No content to write to sheet")
                 return False
             
-            # Write to sheet starting from row 2 (after header)
-            range_name = f"{self.sheet_name}!A2:A{len(all_rows) + 1}"
+            # Write to sheet starting from row 2 (after header) - use anchor only for safety
+            range_name = f"{self.sheet_name}!A2"
             
             body = {
                 'values': all_rows

@@ -9,7 +9,6 @@ from both OpenAI and Claude APIs using the latest models.
 import json
 import os
 import logging
-import base64
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
@@ -278,9 +277,8 @@ class WeeklyResearchProcessor:
     def _init_google_sheets(self):
         """Initialize Google Sheets API client"""
         try:
-            # Get base64 encoded service account JSON
-            google_json_b64 = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
-            google_json = base64.b64decode(google_json_b64).decode('utf-8')
+            # Get raw JSON service account credentials
+            google_json = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
@@ -292,8 +290,8 @@ class WeeklyResearchProcessor:
     def _init_openai(self):
         """Initialize OpenAI API client"""
         try:
-            api_key = self._get_env_var('OPENAI_API_KEY')
-            self.openai_client = openai.OpenAI(api_key=api_key)  # Use only this method
+            # OpenAI client automatically reads OPENAI_API_KEY from environment
+            self.openai_client = openai.OpenAI()
             logger.info(f"OpenAI API initialized successfully with model: {OPENAI_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI API: {e}")
@@ -376,7 +374,8 @@ class WeeklyResearchProcessor:
                             }
                         ],
                         max_tokens=16384,  # Maximum tokens for comprehensive weekly research
-                        temperature=0.2  # Precise temperature for consistency
+                        temperature=0.2,  # Precise temperature for consistency
+                        timeout=120  # 2 minute timeout
                     )
                     
                     research_content = response.choices[0].message.content
@@ -440,7 +439,8 @@ Focus on:
                                 "role": "user", 
                                 "content": enhanced_prompt
                             }
-                        ]
+                        ],
+                        timeout=120  # 2 minute timeout
                     )
                     
                     research_content = response.content[0].text
@@ -468,7 +468,9 @@ Focus on:
         trade_rows = self._extract_trade_data(research_content, source, timestamp)
         
         if trade_rows:
-            # If we successfully extracted structured data, use it
+            # CRITICAL: Add sentinel row in column A for idempotency tracking of structured data
+            rows.append([f"=== {source.upper()} STRUCTURED DATA - {timestamp} - ID:{idempotency_key} ==="])
+            rows.append([])  # Empty separator
             rows.extend(trade_rows)
         else:
             # Fallback to free-form text if parsing fails
@@ -650,11 +652,8 @@ Focus on:
                 logger.error("No content to write to sheet")
                 return False
             
-            # Write to sheet starting from row 2 (after header)
-            if len(all_rows[0]) == 22:  # Structured data (updated for 22 columns)
-                range_name = f"{self.sheet_name}!A2:V{len(all_rows) + 1}"
-            else:  # Free-form text
-                range_name = f"{self.sheet_name}!A2:A{len(all_rows) + 1}"
+            # Write to sheet starting from row 2 (after header) - use anchor only for safety
+            range_name = f"{self.sheet_name}!A2"
             
             body = {
                 'values': all_rows
