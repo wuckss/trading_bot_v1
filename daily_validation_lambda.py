@@ -9,6 +9,8 @@ and narrow down trades from both OpenAI and Claude APIs.
 import json
 import os
 import logging
+import base64
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 import hashlib
@@ -19,17 +21,26 @@ import anthropic
 import pandas_market_calendars as mcal
 import pytz
 
+# For local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file if it exists (local development only)
+except ImportError:
+    pass  # python-dotenv not available in Lambda runtime
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# MODEL CONFIGURATION - Update these when newer models are released
-OPENAI_MODEL = "gpt-4o"  # Latest GPT-4 model
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"  # Latest Claude 3.5 Sonnet
-ENABLE_DEEP_RESEARCH = False  # Standard mode for daily validation (change to True if needed)
+# Load configuration from environment variables
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+ENABLE_DEEP_RESEARCH = os.getenv('ENABLE_DEEP_RESEARCH', 'false').lower() == 'true'
 
-# .env.example file path
-ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), '.env.example')
+# Google Sheets configuration
+DAILY_SHEET_ID = os.getenv('GOOGLE_SHEETS_DAILY_ID', '1zBze8TrvAwYi4zH8qbL-pyMWnJ7gQKGRji8rL1VmKoM')
+DAILY_AM_SHEET_NAME = os.getenv('DAILY_AM_SHEET_NAME', 'Daily_AM')
+DAILY_PM_SHEET_NAME = os.getenv('DAILY_PM_SHEET_NAME', 'Daily_PM')
 
 # Market and timezone configuration
 US_EASTERN = pytz.timezone('US/Eastern')
@@ -86,37 +97,27 @@ class DailyValidationProcessor:
     """Handles daily trade validation and Google Sheets population"""
     
     def __init__(self, session_type: str = "AM"):
-        self.spreadsheet_id = "1zBze8TrvAwYi4zH8qbL-pyMWnJ7gQKGRji8rL1VmKoM"
+        self.spreadsheet_id = DAILY_SHEET_ID
         self.session_type = session_type  # "AM" or "PM"
-        self.sheet_name = f"Daily_{session_type}"  # "Daily_AM" or "Daily_PM"
+        self.sheet_name = DAILY_AM_SHEET_NAME if session_type == "AM" else DAILY_PM_SHEET_NAME
+        self.run_id = self._generate_run_id()
         
         # Initialize API clients
         self._init_google_sheets()
         self._init_openai()
-        self._init_claude()
+        self._init_anthropic()
     
-    def _load_env_file(self) -> Dict[str, str]:
-        """Load environment variables from .env.example file"""
-        env_vars = {}
-        try:
-            if os.path.exists(ENV_FILE_PATH):
-                with open(ENV_FILE_PATH, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip()
-                            # Remove quotes if present
-                            if value.startswith('"') and value.endswith('"'):
-                                value = value[1:-1]
-                            elif value.startswith("'") and value.endswith("'"):
-                                value = value[1:-1]
-                            env_vars[key] = value
-            return env_vars
-        except Exception as e:
-            logger.warning(f"Failed to load .env.example file: {e}")
-            return {}
+    def _generate_run_id(self) -> str:
+        """Generate unique run ID for this execution"""
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"DV_{self.session_type}_{timestamp}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+    
+    def _get_env_var(self, key: str, required: bool = True) -> str:
+        """Get environment variable with proper error handling"""
+        value = os.getenv(key)
+        if not value and required:
+            raise ValueError(f"Required environment variable {key} not found")
+        return value or ""
     
     def _generate_idempotency_key(self) -> str:
         """Generate idempotency key based on date + session + timestamp bucket"""
@@ -214,28 +215,12 @@ class DailyValidationProcessor:
             logger.warning(f"Idempotency check failed, proceeding anyway: {e}")
             return True  # Fail open
     
-    def _get_api_key(self, key_name: str) -> str:
-        """Get API key from .env.example file or environment variable"""
-        # First try loading from .env.example file
-        env_vars = self._load_env_file()
-        env_key = env_vars.get(key_name, "").strip()
-        
-        # Check if it's not a placeholder
-        if env_key and not env_key.startswith('sk-your-') and not env_key.startswith('sk-ant-your-') and not 'your-project-id' in env_key:
-            return env_key
-        
-        # Fall back to environment variable
-        env_key = os.environ.get(key_name, "").strip()
-        if env_key:
-            return env_key
-            
-        raise ValueError(f"API key {key_name} not found in .env.example file or environment variables. Please update .env.example with your actual API keys.")
-    
     def _init_google_sheets(self):
         """Initialize Google Sheets API client"""
         try:
-            # Get service account credentials from hardcoded config or environment
-            google_json = self._get_api_key('GOOGLE_SERVICE_ACCOUNT_JSON')
+            # Get base64 encoded service account JSON
+            google_json_b64 = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
+            google_json = base64.b64decode(google_json_b64).decode('utf-8')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
@@ -247,22 +232,21 @@ class DailyValidationProcessor:
     def _init_openai(self):
         """Initialize OpenAI API client"""
         try:
-            api_key = self._get_api_key('OPENAI_API_KEY')
-            openai.api_key = api_key
+            api_key = self._get_env_var('OPENAI_API_KEY')
             self.openai_client = openai.OpenAI(api_key=api_key)
-            logger.info("OpenAI API initialized successfully")
+            logger.info(f"OpenAI API initialized successfully with model: {OPENAI_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI API: {e}")
             raise
     
-    def _init_claude(self):
-        """Initialize Claude API client"""
+    def _init_anthropic(self):
+        """Initialize Anthropic API client"""
         try:
-            api_key = self._get_api_key('CLAUDE_API_KEY')
-            self.claude_client = anthropic.Anthropic(api_key=api_key)
-            logger.info("Claude API initialized successfully")
+            api_key = self._get_env_var('ANTHROPIC_API_KEY')
+            self.anthropic_client = anthropic.Anthropic(api_key=api_key)
+            logger.info(f"Anthropic API initialized successfully with model: {CLAUDE_MODEL}")
         except Exception as e:
-            logger.error(f"Failed to initialize Claude API: {e}")
+            logger.error(f"Failed to initialize Anthropic API: {e}")
             raise
     
     def get_previous_research_data(self) -> str:
@@ -342,6 +326,7 @@ class DailyValidationProcessor:
             validation_prompt = f"""
             {session_context}
             Current date/time: {datetime.now(timezone.utc).isoformat()}
+            Run ID: {self.run_id}
             
             {DAILY_VALIDATION_PROMPT}
             
@@ -355,32 +340,42 @@ class DailyValidationProcessor:
             - Include risk summary and portfolio heat assessment
             """
             
-            response = self.openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a professional trading desk analyst providing daily trade validation and risk assessment. Be concise and actionable."
-                    },
-                    {
-                        "role": "user",
-                        "content": validation_prompt
-                    }
-                ],
-                max_tokens=2000,
-                temperature=0.2  # Low temperature for consistent analysis
-            )
-            
-            validation_content = response.choices[0].message.content
-            logger.info("OpenAI validation generated successfully")
-            return validation_content
+            # Retry logic with exponential backoff
+            for attempt in range(3):
+                try:
+                    response = self.openai_client.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You are a professional trading desk analyst providing daily trade validation and risk assessment. Be concise and actionable."
+                            },
+                            {
+                                "role": "user",
+                                "content": validation_prompt
+                            }
+                        ],
+                        max_tokens=2000,
+                        temperature=0.2
+                    )
+                    
+                    validation_content = response.choices[0].message.content
+                    logger.info(f"OpenAI validation generated successfully on attempt {attempt + 1}")
+                    return validation_content
+                    
+                except Exception as e:
+                    logger.warning(f"OpenAI API attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    else:
+                        raise e
             
         except Exception as e:
             logger.error(f"Failed to generate OpenAI validation: {e}")
             return None
     
-    def get_claude_validation(self, previous_data: str) -> Optional[str]:
-        """Generate validation using Claude's model"""
+    def get_anthropic_validation(self, previous_data: str) -> Optional[str]:
+        """Generate validation using Anthropic's Claude model"""
         try:
             logger.info(f"Generating Claude validation using model: {CLAUDE_MODEL}")
             
@@ -389,6 +384,7 @@ class DailyValidationProcessor:
             validation_prompt = f"""
             {session_context}
             Current date/time: {datetime.now(timezone.utc).isoformat()}
+            Run ID: {self.run_id}
             
             {DAILY_VALIDATION_PROMPT}
             
@@ -402,25 +398,35 @@ class DailyValidationProcessor:
             - Include risk summary and portfolio heat assessment
             """
             
-            response = self.claude_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=2000,
-                temperature=0.2,  # Low temperature for consistent analysis
-                system="You are an experienced trading desk analyst providing daily trade validation. Focus on actionable insights and risk management.",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": validation_prompt
-                    }
-                ]
-            )
-            
-            validation_content = response.content[0].text
-            logger.info("Claude validation generated successfully")
-            return validation_content
+            # Retry logic with exponential backoff
+            for attempt in range(3):
+                try:
+                    response = self.anthropic_client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=2000,
+                        temperature=0.2,
+                        system="You are an experienced trading desk analyst providing daily trade validation. Focus on actionable insights and risk management.",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": validation_prompt
+                            }
+                        ]
+                    )
+                    
+                    validation_content = response.content[0].text
+                    logger.info(f"Claude validation generated successfully on attempt {attempt + 1}")
+                    return validation_content
+                    
+                except Exception as e:
+                    logger.warning(f"Claude API attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    else:
+                        raise e
             
         except Exception as e:
-            logger.error(f"Failed to generate Claude validation: {e}")
+            logger.error(f"Failed to generate Claude validation after retries: {e}")
             return None
     
     def parse_validation_to_rows(self, validation_content: str, source: str) -> List[List[str]]:
@@ -465,17 +471,14 @@ class DailyValidationProcessor:
         try:
             all_rows = []
             
-            # Create headers for daily validation
-            headers = [
-                f"{self.session_type} Validation Content", "Additional Notes", "Timestamp", 
-                "AI Source", "Session Type", "Status"
-            ]
+            # Create headers for daily validation - single column for content
+            headers = ["Validation Content"]
             
             # Check if headers exist, if not create them
             try:
                 result = self.sheets_service.spreadsheets().values().get(
                     spreadsheetId=self.spreadsheet_id,
-                    range=f"{self.sheet_name}!A1:F1"
+                    range=f"{self.sheet_name}!A1:A1"
                 ).execute()
                 
                 existing_headers = result.get('values', [[]])
@@ -483,7 +486,7 @@ class DailyValidationProcessor:
                     # Write headers
                     self.sheets_service.spreadsheets().values().update(
                         spreadsheetId=self.spreadsheet_id,
-                        range=f"{self.sheet_name}!A1:F1",
+                        range=f"{self.sheet_name}!A1:A1",
                         valueInputOption='RAW',
                         body={'values': [headers]}
                     ).execute()
@@ -583,7 +586,7 @@ class DailyValidationProcessor:
                 results['errors'].append(f"OpenAI error: {str(e)}")
             
             try:
-                claude_content = self.get_claude_validation(previous_data)
+                claude_content = self.get_anthropic_validation(previous_data)
                 results['claude_success'] = claude_content is not None
             except Exception as e:
                 results['errors'].append(f"Claude error: {str(e)}")

@@ -9,10 +9,11 @@ from both OpenAI and Claude APIs using the latest models.
 import json
 import os
 import logging
+import base64
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 import hashlib
-import boto3
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 import openai
@@ -20,17 +21,25 @@ import anthropic
 import pandas_market_calendars as mcal
 import pytz
 
+# For local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file if it exists (local development only)
+except ImportError:
+    pass  # python-dotenv not available in Lambda runtime
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# MODEL CONFIGURATION - Update these when newer models are released
-OPENAI_MODEL = "gpt-4o"  # Latest GPT-4 model with research capabilities
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"  # Latest Claude 3.5 Sonnet
-ENABLE_DEEP_RESEARCH = True  # Enable enhanced research mode for both models
+# Load configuration from environment variables
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+ENABLE_DEEP_RESEARCH = os.getenv('ENABLE_DEEP_RESEARCH', 'true').lower() == 'true'
 
-# .env.example file path
-ENV_FILE_PATH = os.path.join(os.path.dirname(__file__), '.env.example')
+# Google Sheets configuration
+WEEKLY_SHEET_ID = os.getenv('GOOGLE_SHEETS_WEEKLY_ID', '1zBze8TrvAwYi4zH8qbL-pyMWnJ7gQKGRji8rL1VmKoM')
+WEEKLY_SHEET_NAME = os.getenv('WEEKLY_SHEET_NAME', 'Weekly_Research')
 
 # Market and timezone configuration
 US_EASTERN = pytz.timezone('US/Eastern')
@@ -114,36 +123,26 @@ class WeeklyResearchProcessor:
     """Handles weekly trading research generation and Google Sheets population"""
     
     def __init__(self):
-        self.spreadsheet_id = "1zBze8TrvAwYi4zH8qbL-pyMWnJ7gQKGRji8rL1VmKoM"
-        self.sheet_name = "Weekly_Research"
+        self.spreadsheet_id = WEEKLY_SHEET_ID
+        self.sheet_name = WEEKLY_SHEET_NAME
+        self.run_id = self._generate_run_id()
         
         # Initialize API clients
         self._init_google_sheets()
         self._init_openai()
-        self._init_claude()
+        self._init_anthropic()
     
-    def _load_env_file(self) -> Dict[str, str]:
-        """Load environment variables from .env.example file"""
-        env_vars = {}
-        try:
-            if os.path.exists(ENV_FILE_PATH):
-                with open(ENV_FILE_PATH, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip()
-                            # Remove quotes if present
-                            if value.startswith('"') and value.endswith('"'):
-                                value = value[1:-1]
-                            elif value.startswith("'") and value.endswith("'"):
-                                value = value[1:-1]
-                            env_vars[key] = value
-            return env_vars
-        except Exception as e:
-            logger.warning(f"Failed to load .env.example file: {e}")
-            return {}
+    def _generate_run_id(self) -> str:
+        """Generate unique run ID for this execution"""
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"WR_{timestamp}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+    
+    def _get_env_var(self, key: str, required: bool = True) -> str:
+        """Get environment variable with proper error handling"""
+        value = os.getenv(key)
+        if not value and required:
+            raise ValueError(f"Required environment variable {key} not found")
+        return value or ""
     
     def _generate_idempotency_key(self) -> str:
         """Generate idempotency key based on ISO week + Sunday timestamp bucket"""
@@ -261,28 +260,12 @@ class WeeklyResearchProcessor:
             logger.warning(f"Idempotency check failed, proceeding anyway: {e}")
             return True  # Fail open
     
-    def _get_api_key(self, key_name: str) -> str:
-        """Get API key from .env.example file or environment variable"""
-        # First try loading from .env.example file
-        env_vars = self._load_env_file()
-        env_key = env_vars.get(key_name, "").strip()
-        
-        # Check if it's not a placeholder
-        if env_key and not env_key.startswith('sk-your-') and not env_key.startswith('sk-ant-your-') and not 'your-project-id' in env_key:
-            return env_key
-        
-        # Fall back to environment variable
-        env_key = os.environ.get(key_name, "").strip()
-        if env_key:
-            return env_key
-            
-        raise ValueError(f"API key {key_name} not found in .env.example file or environment variables. Please update .env.example with your actual API keys.")
-    
     def _init_google_sheets(self):
         """Initialize Google Sheets API client"""
         try:
-            # Get service account credentials from hardcoded config or environment
-            google_json = self._get_api_key('GOOGLE_SERVICE_ACCOUNT_JSON')
+            # Get base64 encoded service account JSON
+            google_json_b64 = self._get_env_var('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
+            google_json = base64.b64decode(google_json_b64).decode('utf-8')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
@@ -294,22 +277,21 @@ class WeeklyResearchProcessor:
     def _init_openai(self):
         """Initialize OpenAI API client"""
         try:
-            api_key = self._get_api_key('OPENAI_API_KEY')
-            openai.api_key = api_key
-            self.openai_client = openai.OpenAI(api_key=api_key)
-            logger.info("OpenAI API initialized successfully")
+            api_key = self._get_env_var('OPENAI_API_KEY')
+            self.openai_client = openai.OpenAI(api_key=api_key)  # Use only this method
+            logger.info(f"OpenAI API initialized successfully with model: {OPENAI_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI API: {e}")
             raise
     
-    def _init_claude(self):
-        """Initialize Claude API client"""
+    def _init_anthropic(self):
+        """Initialize Anthropic API client"""
         try:
-            api_key = self._get_api_key('CLAUDE_API_KEY')
-            self.claude_client = anthropic.Anthropic(api_key=api_key)
-            logger.info("Claude API initialized successfully")
+            api_key = self._get_env_var('ANTHROPIC_API_KEY')
+            self.anthropic_client = anthropic.Anthropic(api_key=api_key)
+            logger.info(f"Anthropic API initialized successfully with model: {CLAUDE_MODEL}")
         except Exception as e:
-            logger.error(f"Failed to initialize Claude API: {e}")
+            logger.error(f"Failed to initialize Anthropic API: {e}")
             raise
     
     def clear_sheet_except_header(self) -> bool:
@@ -350,6 +332,7 @@ class WeeklyResearchProcessor:
             DEEP RESEARCH MODE ENABLED: Use all available knowledge, analysis capabilities, and reasoning to provide the most comprehensive trading research possible.
             
             Current date/time: {datetime.now(timezone.utc).isoformat()}
+            Run ID: {self.run_id}
             
             {TRADING_RESEARCH_PROMPT}
             
@@ -362,26 +345,35 @@ class WeeklyResearchProcessor:
             - Provide detailed risk assessment and position sizing logic
             """
             
-            # Use the configured model
-            response = self.openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": "You are an expert Wall Street trading analyst with deep market knowledge and research capabilities. Provide detailed, actionable trading research."
-                    },
-                    {
-                        "role": "user",
-                        "content": enhanced_prompt
-                    }
-                ],
-                max_tokens=4000,
-                temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.7  # Lower temperature for more focused research
-            )
-            
-            research_content = response.choices[0].message.content
-            logger.info("OpenAI research generated successfully")
-            return research_content
+            # Retry logic with exponential backoff
+            for attempt in range(3):
+                try:
+                    response = self.openai_client.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[
+                            {
+                                "role": "system", 
+                                "content": "You are an expert Wall Street trading analyst with deep market knowledge and research capabilities. Provide detailed, actionable trading research."
+                            },
+                            {
+                                "role": "user",
+                                "content": enhanced_prompt
+                            }
+                        ],
+                        max_tokens=4000,
+                        temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.7
+                    )
+                    
+                    research_content = response.choices[0].message.content
+                    logger.info(f"OpenAI research generated successfully on attempt {attempt + 1}")
+                    return research_content
+                    
+                except Exception as e:
+                    logger.warning(f"OpenAI API attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        raise e
             
         except Exception as e:
             logger.error(f"Failed to generate OpenAI research: {e}")
@@ -407,6 +399,7 @@ Focus on:
             DEEP RESEARCH MODE: {'ENABLED' if ENABLE_DEEP_RESEARCH else 'STANDARD'} 
             
             Current date/time: {datetime.now(timezone.utc).isoformat()}
+            Run ID: {self.run_id}
             
             {TRADING_RESEARCH_PROMPT}
             
@@ -419,25 +412,35 @@ Focus on:
             - Provide detailed execution strategies and risk management protocols''' if ENABLE_DEEP_RESEARCH else ''}
             """
             
-            response = self.claude_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=8000,
-                temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.3,  # Lower temperature for research mode
-                system=system_prompt if ENABLE_DEEP_RESEARCH else "You are an experienced trading analyst providing actionable market research.",
-                messages=[
-                    {
-                        "role": "user", 
-                        "content": enhanced_prompt
-                    }
-                ]
-            )
-            
-            research_content = response.content[0].text
-            logger.info("Claude research generated successfully")
-            return research_content
+            # Retry logic with exponential backoff
+            for attempt in range(3):
+                try:
+                    response = self.anthropic_client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=8000,
+                        temperature=0.1 if ENABLE_DEEP_RESEARCH else 0.3,
+                        system=system_prompt if ENABLE_DEEP_RESEARCH else "You are an experienced trading analyst providing actionable market research.",
+                        messages=[
+                            {
+                                "role": "user", 
+                                "content": enhanced_prompt
+                            }
+                        ]
+                    )
+                    
+                    research_content = response.content[0].text
+                    logger.info(f"Claude research generated successfully on attempt {attempt + 1}")
+                    return research_content
+                    
+                except Exception as e:
+                    logger.warning(f"Claude API attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        raise e
             
         except Exception as e:
-            logger.error(f"Failed to generate Claude research: {e}")
+            logger.error(f"Failed to generate Claude research after retries: {e}")
             return None
     
     def parse_research_to_rows(self, research_content: str, source: str) -> List[List[str]]:
@@ -519,10 +522,11 @@ Focus on:
         ticker = ticker_match.group(1)
         
         # Initialize row with empty values for all columns
-        row = [''] * 21  # 21 columns total (added Current Price)
+        row = [''] * 22  # 22 columns total (added Current Price + Run ID)
         row[0] = ticker  # Ticker
-        row[18] = source  # AI Source
-        row[19] = timestamp  # Generated Timestamp
+        row[19] = source  # AI Source
+        row[20] = timestamp  # Generated Timestamp
+        row[21] = self.run_id  # Run ID
         
         # Join the context to search for patterns
         full_context = ' '.join(context_lines[:5])
@@ -569,7 +573,7 @@ Focus on:
         if len(parts) < 2:
             return None
             
-        row = [''] * 21
+        row = [''] * 22
         
         # Map parts to appropriate columns (shifted by 1 due to Current Price column)
         row[0] = parts[0] if len(parts) > 0 else ''  # Ticker
@@ -577,8 +581,9 @@ Focus on:
         row[2] = parts[2] if len(parts) > 2 else ''  # Market Cap 
         row[3] = parts[3] if len(parts) > 3 else ''  # Volume or other data
         row[6] = parts[4] if len(parts) > 4 else ''  # Thesis
-        row[18] = source  # AI Source
-        row[19] = timestamp  # Timestamp
+        row[19] = source  # AI Source
+        row[20] = timestamp  # Timestamp
+        row[21] = self.run_id  # Run ID
         
         return row
     
@@ -593,14 +598,14 @@ Focus on:
                 "Thesis", "Entry Zone", "Stop Loss", "Target T1", "Target T2", "Target T3",
                 "Position Size %", "Risk:Reward Ratio", "Expected 5-Day Move %", 
                 "Confidence (1-5)", "Key Risks", "Options Alternative", "Execution Notes",
-                "AI Source", "Generated Timestamp"
+                "AI Source", "Generated Timestamp", "Run ID"
             ]
             
             # Check if headers exist, if not create them
             try:
                 result = self.sheets_service.spreadsheets().values().get(
                     spreadsheetId=self.spreadsheet_id,
-                    range=f"{self.sheet_name}!A1:U1"
+                    range=f"{self.sheet_name}!A1:V1"
                 ).execute()
                 
                 existing_headers = result.get('values', [[]])
@@ -608,7 +613,7 @@ Focus on:
                     # Write headers
                     self.sheets_service.spreadsheets().values().update(
                         spreadsheetId=self.spreadsheet_id,
-                        range=f"{self.sheet_name}!A1:U1",
+                        range=f"{self.sheet_name}!A1:V1",
                         valueInputOption='RAW',
                         body={'values': [headers]}
                     ).execute()
@@ -621,7 +626,7 @@ Focus on:
                 openai_rows = self.parse_research_to_rows(openai_content, "OpenAI")
                 all_rows.extend(openai_rows)
             
-            # Add Claude content if available
+            # Add Claude content if available  
             if claude_content:
                 claude_rows = self.parse_research_to_rows(claude_content, "Claude")
                 all_rows.extend(claude_rows)
@@ -631,8 +636,8 @@ Focus on:
                 return False
             
             # Write to sheet starting from row 2 (after header)
-            if len(all_rows[0]) == 21:  # Structured data (updated for 21 columns)
-                range_name = f"{self.sheet_name}!A2:U{len(all_rows) + 1}"
+            if len(all_rows[0]) == 22:  # Structured data (updated for 22 columns)
+                range_name = f"{self.sheet_name}!A2:V{len(all_rows) + 1}"
             else:  # Free-form text
                 range_name = f"{self.sheet_name}!A2:A{len(all_rows) + 1}"
             
