@@ -7,3 +7,4 @@ anthropic==0.35.0
 pandas-market-calendars==4.3.3
 pytz==2024.1
 python-dotenv==1.0.0
+requests==2.31.0

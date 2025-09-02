@@ -19,6 +19,7 @@ import openai
 import anthropic
 import pandas_market_calendars as mcal
 import pytz
+import requests
 
 # For local development
 try:
@@ -44,6 +45,10 @@ DAILY_PM_SHEET_NAME = os.getenv('DAILY_PM_SHEET_NAME', 'Daily_PM')
 # Market and timezone configuration
 US_EASTERN = pytz.timezone('US/Eastern')
 NYSE_CALENDAR = mcal.get_calendar('NYSE')
+
+# Telegram configuration
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # Daily validation prompt
 DAILY_VALIDATION_PROMPT = """Title: Daily Trade Validation & Narrowing — Micro/Mid-Cap Desk
@@ -254,6 +259,92 @@ class DailyValidationProcessor:
         except Exception as e:
             logger.error(f"Failed to initialize Anthropic API: {e}")
             raise
+    
+    def _send_telegram_notification(self, message: str, session_type: str) -> bool:
+        """Send Telegram notification with validation results"""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.warning("Telegram credentials not configured, skipping notification")
+            return False
+            
+        try:
+            # Format message for Telegram
+            formatted_message = f"🔔 *Daily {session_type} Validation Complete*\n\n{message}"
+            
+            # Telegram API URL
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            
+            # Prepare payload
+            payload = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': formatted_message,
+                'parse_mode': 'Markdown',
+                'disable_web_page_preview': True
+            }
+            
+            # Send with retry logic
+            for attempt in range(3):
+                try:
+                    response = requests.post(url, json=payload, timeout=30)
+                    
+                    if response.status_code == 200:
+                        logger.info(f"Telegram notification sent successfully for {session_type} session")
+                        return True
+                    else:
+                        logger.warning(f"Telegram API returned status {response.status_code}: {response.text}")
+                        
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Telegram request timeout on attempt {attempt + 1}")
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Telegram request failed on attempt {attempt + 1}: {e}")
+                
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+            
+            logger.error("Failed to send Telegram notification after 3 attempts")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Telegram notification error: {e}")
+            return False
+    
+    def _format_telegram_message(self, combined_content: str, session_type: str) -> str:
+        """Format the validation content for Telegram"""
+        try:
+            # Truncate if too long (Telegram has 4096 char limit)
+            if len(combined_content) > 3500:
+                combined_content = combined_content[:3500] + "...\n\n[Content truncated for Telegram]"
+            
+            # Add session info and timestamp
+            now_et = datetime.now(US_EASTERN)
+            timestamp = now_et.strftime("%Y-%m-%d %H:%M EST")
+            
+            formatted = f"📊 *{session_type.upper()} Session Results*\n"
+            formatted += f"⏰ {timestamp}\n"
+            formatted += f"🎯 Run ID: `{self.run_id}`\n\n"
+            formatted += "📋 *Validation Summary:*\n"
+            formatted += f"```\n{combined_content}\n```"
+            
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"Error formatting Telegram message: {e}")
+            # Fallback to simple format
+            return f"{session_type.upper()} Validation Complete\n\n{combined_content[:3000]}"
+    
+    def _combine_validation_content(self, openai_content: Optional[str], claude_content: Optional[str]) -> str:
+        """Combine OpenAI and Claude validation content for Telegram"""
+        combined = ""
+        
+        if openai_content:
+            combined += f"🤖 OpenAI Analysis:\n{openai_content[:1500]}\n\n"
+        
+        if claude_content:
+            combined += f"🧠 Claude Analysis:\n{claude_content[:1500]}\n\n"
+        
+        if not combined:
+            combined = "No validation content generated."
+            
+        return combined.strip()
     
     def get_previous_research_data(self) -> str:
         """Fetch previous A-book and watchlist data from Weekly_Research sheet"""
@@ -602,6 +693,12 @@ class DailyValidationProcessor:
             # Step 7: Write results to sheet
             if openai_content or claude_content:
                 results['sheet_updated'] = self.write_to_sheet(openai_content, claude_content)
+                
+                # Step 8: Send Telegram notification if successful
+                if results['sheet_updated']:
+                    combined_content = self._combine_validation_content(openai_content, claude_content)
+                    telegram_message = self._format_telegram_message(combined_content, self.session_type)
+                    results['telegram_sent'] = self._send_telegram_notification(telegram_message, self.session_type)
             
             # Overall success if at least one AI succeeded and sheet was updated
             results['success'] = (results['openai_success'] or results['claude_success']) and results['sheet_updated']
