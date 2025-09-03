@@ -236,6 +236,7 @@ class DailyValidationProcessor:
             google_json = base64.b64decode(google_json_b64).decode('utf-8')
             service_account_info = json.loads(google_json)
             credentials = Credentials.from_service_account_info(service_account_info)
+            credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
             self.sheets_service = build('sheets', 'v4', credentials=credentials)
             logger.info("Google Sheets API initialized successfully")
         except Exception as e:

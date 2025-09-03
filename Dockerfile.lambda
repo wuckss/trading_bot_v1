@@ -5,12 +5,15 @@ FROM public.ecr.aws/lambda/python:3.9
 RUN yum update -y && \
     yum install -y zip
 
+# Set working directory
+WORKDIR /build
+
 # Copy requirements and install Python dependencies
 COPY requirements.txt ./
-RUN pip install -r requirements.txt -t /tmp/lambda-package
+RUN pip install -r requirements.txt -t /tmp/lambda-deps
 
-# Create deployment packages
-WORKDIR /tmp/lambda-package
+# Create base package directory with dependencies
+WORKDIR /tmp/lambda-deps
 
 # Remove unnecessary files to reduce package size
 RUN find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
@@ -20,13 +23,18 @@ RUN find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && 
     find . -name "tests" -type d -exec rm -rf {} + 2>/dev/null || true && \
     find . -name "test" -type d -exec rm -rf {} + 2>/dev/null || true
 
-# Copy Lambda functions
+# Create weekly research package
 COPY weekly_research_lambda.py lambda_function.py
-RUN zip -r /tmp/weekly-research.zip . -x "*.git*" "*.pyc" "*__pycache__*"
+RUN zip -r /tmp/weekly-research.zip . -x "*.git*" "*.pyc" "*__pycache__*" "lambda_function.py"
+RUN zip -j /tmp/weekly-research.zip lambda_function.py
 
-# Reset and create daily package
-RUN rm lambda_function.py
+# Create daily validation package (clean copy of dependencies + new lambda function)
+RUN rm -f lambda_function.py
 COPY daily_validation_lambda.py lambda_function.py
-RUN zip -r /tmp/daily-validation.zip . -x "*.git*" "*.pyc" "*__pycache__*"
+RUN zip -r /tmp/daily-validation.zip . -x "*.git*" "*.pyc" "*__pycache__*" "lambda_function.py"
+RUN zip -j /tmp/daily-validation.zip lambda_function.py
+
+# Verify packages were created
+RUN ls -la /tmp/*.zip
 
 CMD ["echo", "Lambda packages built successfully"]
