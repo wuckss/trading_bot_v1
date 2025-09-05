@@ -14,7 +14,7 @@ import base64
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 import hashlib
-from googleapiclient.discovery import build
+import gspread
 from google.oauth2.service_account import Credentials
 import openai
 import anthropic
